@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::proto::{
-    node_debug_interface::{DumpJemallocHeapProfileRequest, GetNodeDetailsRequest},
+    node_debug_interface::GetNodeDetailsRequest,
     node_debug_interface_grpc::NodeDebugInterfaceClient,
 };
 use failure::prelude::*;
@@ -14,33 +14,26 @@ pub mod proto;
 
 pub mod node_debug_helpers;
 pub mod node_debug_service;
+#[macro_use]
+pub mod json_log;
 
 /// Implement default utility client for NodeDebugInterface
 pub struct NodeDebugClient {
     client: NodeDebugInterfaceClient,
-    address: String,
-    port: u16,
 }
 
 impl NodeDebugClient {
     pub fn new<A: AsRef<str>>(address: A, port: u16) -> Self {
+        Self::from_socket_addr_str(&format!("{}:{}", address.as_ref(), port))
+    }
+
+    /// Create NodeDebugInterfaceClient from a valid socket address.
+    pub fn from_socket_addr_str<A: AsRef<str>>(socket_addr: A) -> Self {
         let env = Arc::new(EnvBuilder::new().name_prefix("grpc-debug-").build());
-        let ch = ChannelBuilder::new(env).connect(&format!("{}:{}", address.as_ref(), port));
+        let ch = ChannelBuilder::new(env).connect(&socket_addr.as_ref());
         let client = NodeDebugInterfaceClient::new(ch);
 
-        Self {
-            client,
-            address: address.as_ref().to_owned(),
-            port,
-        }
-    }
-
-    pub fn get_address(&self) -> &str {
-        &self.address
-    }
-
-    pub fn get_port(&self) -> u16 {
-        self.port
+        Self { client }
     }
 
     pub fn get_node_metric<S: AsRef<str>>(&self, metric: S) -> Result<Option<i64>> {
@@ -66,14 +59,5 @@ impl NodeDebugClient {
                 )),
             })
             .collect()
-    }
-
-    pub fn dump_heap_profile(&self) -> Result<i32> {
-        let response = self
-            .client
-            .dump_jemalloc_heap_profile(&DumpJemallocHeapProfileRequest::new())
-            .context("Unable to request heap dump")?;
-
-        Ok(response.status_code)
     }
 }

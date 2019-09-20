@@ -4,9 +4,10 @@
 
 use crate::loaded_data::loaded_module::LoadedModule;
 use bytecode_verifier::VerifiedModule;
+use types::identifier::IdentStr;
 use vm::{
     access::ModuleAccess,
-    file_format::{Bytecode, CodeUnit, FunctionDefinitionIndex},
+    file_format::{Bytecode, CodeUnit, FunctionDefinitionIndex, FunctionHandle, FunctionSignature},
     internals::ModuleIndex,
 };
 
@@ -34,7 +35,10 @@ pub trait FunctionReference<'txn>: Sized + Clone {
     fn is_native(&self) -> bool;
 
     /// Return the name of the function
-    fn name(&self) -> &'txn str;
+    fn name(&self) -> &'txn IdentStr;
+
+    /// Returns the signature of the function.
+    fn signature(&self) -> &'txn FunctionSignature;
 }
 
 /// Resolved form of a function handle
@@ -42,18 +46,18 @@ pub trait FunctionReference<'txn>: Sized + Clone {
 pub struct FunctionRef<'txn> {
     module: &'txn LoadedModule,
     def: &'txn FunctionDef,
-    name: &'txn str,
+    handle: &'txn FunctionHandle,
 }
 
 impl<'txn> FunctionReference<'txn> for FunctionRef<'txn> {
     fn new(module: &'txn LoadedModule, idx: FunctionDefinitionIndex) -> Self {
         let def = &module.function_defs[idx.into_index()];
         let fn_definition = module.function_def_at(idx);
-        let name_idx = module.function_handle_at(fn_definition.function).name;
+        let handle = module.function_handle_at(fn_definition.function);
         FunctionRef {
             module,
             def,
-            name: module.string_at(name_idx),
+            handle,
         }
     }
 
@@ -81,8 +85,12 @@ impl<'txn> FunctionReference<'txn> for FunctionRef<'txn> {
         (self.def.flags & CodeUnit::NATIVE) == CodeUnit::NATIVE
     }
 
-    fn name(&self) -> &'txn str {
-        self.name
+    fn name(&self) -> &'txn IdentStr {
+        self.module.identifier_at(self.handle.name)
+    }
+
+    fn signature(&self) -> &'txn FunctionSignature {
+        self.module.function_signature_at(self.handle.signature)
     }
 }
 

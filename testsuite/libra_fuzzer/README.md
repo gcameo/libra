@@ -11,6 +11,9 @@ Install [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html) if not 
 
 ### Fuzzing a target
 
+First, switch to the directory this README is in: `cd
+testsuite/libra_fuzzer`.
+
 To list out known fuzz targets, run `cargo run list`.
 
 To be effective, fuzzing requires a corpus of existing inputs. This
@@ -40,7 +43,7 @@ artifact to the test suite, copy it to a file inside
 `artifacts/<target>/`.
 
 `cargo test` will now test the deserializer against the new artifact.
-The test will likely fail at first; use.
+The test will likely fail at first use.
 
 Note that `cargo test` runs each test in a separate process by default
 to isolate failures and memory usage; if you're attaching a debugger and

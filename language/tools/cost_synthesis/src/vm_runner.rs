@@ -12,7 +12,7 @@ macro_rules! with_loaded_vm {
     ($module_generator:expr, $root_account:expr => $vm:ident, $mod:ident, $module_cache:ident) => {
         use vm::access::ModuleAccess;
 
-        let mut modules = STDLIB_MODULES.clone();
+        let mut modules = ::stdlib::stdlib_modules().to_vec();
         let mut generated_modules = $module_generator.collect();
         modules.append(&mut generated_modules);
         // The last module is the root module based upon how we generate modules.
@@ -27,7 +27,6 @@ macro_rules! with_loaded_vm {
         $module_cache.cache_module(root_module.clone());
         let $mod = $module_cache
             .get_loaded_module(&module_id)
-            .expect("[Module Lookup] Invariant violation while looking up module")
             .expect("[Module Lookup] Runtime error while looking up module")
             .expect("[Module Cache] Unable to find module in module cache.");
         for m in modules.clone() {
@@ -42,6 +41,10 @@ macro_rules! with_loaded_vm {
         }
         let mut $vm =
             TransactionExecutor::new(&$module_cache, &data_cache, TransactionMetadata::default());
-        $vm.execution_stack.push_frame(entry_func);
+        $vm.turn_off_gas_metering();
+        match $vm.execution_stack.push_frame(entry_func) {
+            Ok(_) => {}
+            Err(e) => panic!("Unexpected Runtime Error: {:?}", e),
+        }
     };
 }

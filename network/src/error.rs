@@ -50,12 +50,12 @@ pub enum NetworkErrorKind {
     #[fail(display = "Parsing error")]
     ParsingError,
 
-    #[fail(display = "Peer disconnected")]
+    #[fail(display = "Peer not connected")]
     NotConnected,
 }
 
 impl Fail for NetworkError {
-    fn cause(&self) -> Option<&Fail> {
+    fn cause(&self) -> Option<&dyn Fail> {
         self.inner.cause()
     }
 

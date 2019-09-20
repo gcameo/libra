@@ -9,9 +9,11 @@ use crate::{
         },
         transaction::{MempoolAddTransactionStatus, MempoolTransaction, TimelineState},
     },
+    proto::shared::mempool_status::MempoolAddTransactionStatusCode,
     OP_COUNTERS,
 };
 use config::config::MempoolConfig;
+use failure::prelude::*;
 use std::{
     collections::HashMap,
     ops::Bound,
@@ -68,10 +70,12 @@ impl TransactionStore {
         address: &AccountAddress,
         sequence_number: u64,
     ) -> Option<SignedTransaction> {
-        if let Some(txns) = self.transactions.get(&address) {
-            if let Some(txn) = txns.get(&sequence_number) {
-                return Some(txn.txn.clone());
-            }
+        if let Some(txn) = self
+            .transactions
+            .get(&address)
+            .and_then(|txns| txns.get(&sequence_number))
+        {
+            return Some(txn.txn.clone());
         }
         None
     }
@@ -83,12 +87,22 @@ impl TransactionStore {
         txn: MempoolTransaction,
         current_sequence_number: u64,
     ) -> MempoolAddTransactionStatus {
-        let (is_update, status) = self.check_for_update(&txn);
-        if is_update {
-            return status;
+        if self.handle_gas_price_update(&txn).is_err() {
+            return MempoolAddTransactionStatus::new(
+                MempoolAddTransactionStatusCode::InvalidUpdate,
+                format!("Failed to update gas price to {}", txn.get_gas_price()),
+            );
         }
+
         if self.check_if_full() {
-            return MempoolAddTransactionStatus::MempoolIsFull;
+            return MempoolAddTransactionStatus::new(
+                MempoolAddTransactionStatusCode::MempoolIsFull,
+                format!(
+                    "mempool size: {}, capacity: {}",
+                    self.system_ttl_index.size(),
+                    self.capacity,
+                ),
+            );
         }
 
         let address = txn.get_sender();
@@ -101,7 +115,14 @@ impl TransactionStore {
         if let Some(txns) = self.transactions.get_mut(&address) {
             // capacity check
             if txns.len() >= self.capacity_per_user {
-                return MempoolAddTransactionStatus::TooManyTransactions;
+                return MempoolAddTransactionStatus::new(
+                    MempoolAddTransactionStatusCode::TooManyTransactions,
+                    format!(
+                        "txns length: {} capacity per user: {}",
+                        txns.len(),
+                        self.capacity_per_user,
+                    ),
+                );
             }
 
             // insert into storage and other indexes
@@ -111,12 +132,12 @@ impl TransactionStore {
             OP_COUNTERS.set("txn.system_ttl_index", self.system_ttl_index.size());
         }
         self.process_ready_transactions(&address, current_sequence_number);
-        MempoolAddTransactionStatus::Valid
+        MempoolAddTransactionStatus::new(MempoolAddTransactionStatusCode::Valid, "".to_string())
     }
 
-    /// Check whether the queue size >= threshold in config.
+    /// Check if mempool can handle new insertion requests
     pub(crate) fn health_check(&self) -> bool {
-        self.system_ttl_index.size() <= self.capacity
+        self.system_ttl_index.size() < self.capacity || self.parking_lot_index.size() > 0
     }
 
     /// checks if Mempool is full
@@ -125,10 +146,12 @@ impl TransactionStore {
         if self.system_ttl_index.size() >= self.capacity {
             // try to free some space in Mempool from ParkingLot
             if let Some((address, sequence_number)) = self.parking_lot_index.pop() {
-                if let Some(txns) = self.transactions.get_mut(&address) {
-                    if let Some(txn) = txns.remove(&sequence_number) {
-                        self.index_remove(&txn);
-                    }
+                if let Some(txn) = self
+                    .transactions
+                    .get_mut(&address)
+                    .and_then(|txns| txns.remove(&sequence_number))
+                {
+                    self.index_remove(&txn);
                 }
             }
         }
@@ -138,27 +161,25 @@ impl TransactionStore {
     /// check if transaction is already present in Mempool
     /// e.g. given request is update
     /// we allow increase in gas price to speed up process
-    fn check_for_update(
-        &mut self,
-        txn: &MempoolTransaction,
-    ) -> (bool, MempoolAddTransactionStatus) {
-        let mut is_update = false;
-        let mut status = MempoolAddTransactionStatus::Valid;
-
+    fn handle_gas_price_update(&mut self, txn: &MempoolTransaction) -> Result<()> {
         if let Some(txns) = self.transactions.get_mut(&txn.get_sender()) {
             if let Some(current_version) = txns.get_mut(&txn.get_sequence_number()) {
-                is_update = true;
-                // TODO: do we need to ensure the rest of content hasn't changed
-                if txn.get_gas_price() <= current_version.get_gas_price() {
-                    status = MempoolAddTransactionStatus::InvalidUpdate;
+                if current_version.txn.max_gas_amount() == txn.txn.max_gas_amount()
+                    && current_version.txn.payload() == txn.txn.payload()
+                    && current_version.txn.expiration_time() == txn.txn.expiration_time()
+                    && current_version.get_gas_price() < txn.get_gas_price()
+                {
+                    if let Some(txn) = txns.remove(&txn.get_sequence_number()) {
+                        self.index_remove(&txn);
+                    }
                 } else {
-                    self.priority_index.remove(&current_version);
-                    current_version.txn = txn.txn.clone();
-                    self.priority_index.insert(&current_version);
+                    return Err(format_err!("Invalid gas price update. txn gas price: {}, current_version gas price: {}",
+                            txn.get_gas_price(),
+                            current_version.get_gas_price()));
                 }
             }
         }
-        (is_update, status)
+        Ok(())
     }
 
     /// fixes following invariants:
@@ -243,12 +264,14 @@ impl TransactionStore {
         let mut batch = vec![];
         let mut last_timeline_id = timeline_id;
         for (address, sequence_number) in self.timeline_index.read_timeline(timeline_id, count) {
-            if let Some(txns) = self.transactions.get_mut(&address) {
-                if let Some(txn) = txns.get(&sequence_number) {
-                    batch.push(txn.txn.clone());
-                    if let TimelineState::Ready(timeline_id) = txn.timeline_state {
-                        last_timeline_id = timeline_id;
-                    }
+            if let Some(txn) = self
+                .transactions
+                .get_mut(&address)
+                .and_then(|txns| txns.get(&sequence_number))
+            {
+                batch.push(txn.txn.clone());
+                if let TimelineState::Ready(timeline_id) = txn.timeline_state {
+                    last_timeline_id = timeline_id;
                 }
             }
         }

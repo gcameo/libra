@@ -11,6 +11,7 @@ use crate::{
         transaction::{MempoolAddTransactionStatus, MempoolTransaction, TimelineState},
         transaction_store::TransactionStore,
     },
+    proto::shared::mempool_status::MempoolAddTransactionStatusCode,
     OP_COUNTERS,
 };
 use chrono::Utc;
@@ -20,6 +21,7 @@ use lru_cache::LruCache;
 use std::{
     cmp::{max, min},
     collections::HashSet,
+    convert::TryFrom,
 };
 use ttl_cache::TtlCache;
 use types::{account_address::AccountAddress, transaction::SignedTransaction};
@@ -33,7 +35,7 @@ pub struct Mempool {
     // for each transaction, entry with timestamp is added when transaction enters mempool
     // used to measure e2e latency of transaction in system, as well as time it takes to pick it up
     // by consensus
-    metrics_cache: TtlCache<(AccountAddress, u64), i64>,
+    pub(crate) metrics_cache: TtlCache<(AccountAddress, u64), i64>,
     pub system_transaction_timeout: Duration,
 }
 
@@ -83,17 +85,15 @@ impl Mempool {
 
     fn log_latency(&mut self, account: AccountAddress, sequence_number: u64, metric: &str) {
         if let Some(&creation_time) = self.metrics_cache.get(&(account, sequence_number)) {
-            OP_COUNTERS.observe(
-                metric,
-                (Utc::now().timestamp_millis() - creation_time) as f64,
-            );
+            if let Ok(time_delta_ms) = u64::try_from(Utc::now().timestamp_millis() - creation_time)
+            {
+                OP_COUNTERS.observe_duration(metric, Duration::from_millis(time_delta_ms));
+            }
         }
     }
 
-    fn check_balance(&mut self, txn: &SignedTransaction, balance: u64, gas_amount: u64) -> bool {
-        let required_balance = txn.gas_unit_price() * gas_amount
-            + self.transactions.get_required_balance(&txn.sender());
-        balance >= required_balance
+    fn get_required_balance(&mut self, txn: &SignedTransaction, gas_amount: u64) -> u64 {
+        txn.gas_unit_price() * gas_amount + self.transactions.get_required_balance(&txn.sender())
     }
 
     /// Used to add a transaction to the Mempool
@@ -111,8 +111,16 @@ impl Mempool {
             &txn.sender(),
             db_sequence_number
         );
-        if !self.check_balance(&txn, balance, gas_amount) {
-            return MempoolAddTransactionStatus::InsufficientBalance;
+
+        let required_balance = self.get_required_balance(&txn, gas_amount);
+        if balance < required_balance {
+            return MempoolAddTransactionStatus::new(
+                MempoolAddTransactionStatusCode::InsufficientBalance,
+                format!(
+                    "balance: {}, required_balance: {}, gas_amount: {}",
+                    balance, required_balance, gas_amount
+                ),
+            );
         }
 
         let cached_value = self.sequence_number_cache.get_mut(&txn.sender());
@@ -125,18 +133,27 @@ impl Mempool {
 
         // don't accept old transactions (e.g. seq is less than account's current seq_number)
         if txn.sequence_number() < sequence_number {
-            return MempoolAddTransactionStatus::InvalidSeqNumber;
+            return MempoolAddTransactionStatus::new(
+                MempoolAddTransactionStatusCode::InvalidSeqNumber,
+                format!(
+                    "transaction sequence number is {}, current sequence number is  {}",
+                    txn.sequence_number(),
+                    sequence_number,
+                ),
+            );
         }
 
         let expiration_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("init timestamp failure")
             + self.system_transaction_timeout;
-        self.metrics_cache.insert(
-            (txn.sender(), txn.sequence_number()),
-            Utc::now().timestamp_millis(),
-            Duration::from_secs(100),
-        );
+        if timeline_state != TimelineState::NonQualified {
+            self.metrics_cache.insert(
+                (txn.sender(), txn.sequence_number()),
+                Utc::now().timestamp_millis(),
+                Duration::from_secs(100),
+            );
+        }
 
         let txn_info = MempoolTransaction::new(txn, expiration_time, gas_amount, timeline_state);
 
@@ -205,7 +222,7 @@ impl Mempool {
             self.log_latency(
                 transaction.sender(),
                 transaction.sequence_number(),
-                "txn_pre_consensus_ms",
+                "txn_pre_consensus_s",
             );
         }
         block

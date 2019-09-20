@@ -5,17 +5,20 @@
 use crate::common::*;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::collections::HashMap;
-use types::{account_address::AccountAddress, byte_array::ByteArray, language_storage::ModuleId};
+use types::{
+    account_address::AccountAddress, byte_array::ByteArray, identifier::Identifier,
+    language_storage::ModuleId,
+};
 use vm::{
     access::*,
     file_format::{
         MemberCount, ModuleHandle, SignatureToken, StructDefinition, StructDefinitionIndex,
-        StructHandleIndex, TableIndex,
+        StructFieldInformation, StructHandleIndex, TableIndex,
     },
+    vm_string::VMString,
 };
-use vm_runtime::{
-    code_cache::module_cache::ModuleCache, loaded_data::loaded_module::LoadedModule, value::*,
-};
+use vm_runtime::{code_cache::module_cache::ModuleCache, loaded_data::loaded_module::LoadedModule};
+use vm_runtime_types::value::*;
 
 /// A wrapper around state that is used to generate random valid inhabitants for types.
 pub struct RandomInhabitor<'alloc, 'txn>
@@ -33,11 +36,11 @@ where
 
     /// The module cache for all of the other modules in the universe. We need this in order to
     /// resolve struct and function handles to other modules other then the root module.
-    module_cache: &'txn ModuleCache<'alloc>,
+    module_cache: &'txn dyn ModuleCache<'alloc>,
 
     /// A reverse lookup table to find the struct definition for a struct handle. Needed for
     /// generating an inhabitant for a struct SignatureToken. This is lazily populated.
-    struct_handle_table: HashMap<ModuleId, HashMap<String, StructDefinitionIndex>>,
+    struct_handle_table: HashMap<ModuleId, HashMap<Identifier, StructDefinitionIndex>>,
 }
 
 impl<'alloc, 'txn> RandomInhabitor<'alloc, 'txn>
@@ -48,7 +51,10 @@ where
     ///
     /// It initializes each of the internal resolution tables for structs and function handles to
     /// be empty.
-    pub fn new(root_module: &'txn LoadedModule, module_cache: &'txn ModuleCache<'alloc>) -> Self {
+    pub fn new(
+        root_module: &'txn LoadedModule,
+        module_cache: &'txn dyn ModuleCache<'alloc>,
+    ) -> Self {
         let seed: [u8; 32] = [0; 32];
         Self {
             gen: StdRng::from_seed(seed),
@@ -60,8 +66,8 @@ where
 
     fn to_module_id(&self, module_handle: &ModuleHandle) -> ModuleId {
         let address = *self.root_module.address_at(module_handle.address);
-        let name = self.root_module.string_at(module_handle.name);
-        ModuleId::new(address, name.to_string())
+        let name = self.root_module.identifier_at(module_handle.name);
+        ModuleId::new(address, name.into())
     }
 
     fn next_int(&mut self) -> u64 {
@@ -84,6 +90,10 @@ where
         (0..len).map(|_| self.gen.gen::<char>()).collect::<String>()
     }
 
+    fn next_vm_string(&mut self) -> VMString {
+        self.next_str().into()
+    }
+
     fn next_addr(&mut self) -> AccountAddress {
         AccountAddress::new(self.gen.gen())
     }
@@ -97,13 +107,12 @@ where
         StructDefinitionIndex,
     ) {
         let struct_handle = self.root_module.struct_handle_at(struct_handle_index);
-        let struct_name = self.root_module.string_at(struct_handle.name);
+        let struct_name = self.root_module.identifier_at(struct_handle.name);
         let module_handle = self.root_module.module_handle_at(struct_handle.module);
         let module_id = self.to_module_id(module_handle);
         let module = self
             .module_cache
             .get_loaded_module(&module_id)
-            .expect("[Module Lookup] Invariant violation while looking up module")
             .expect("[Module Lookup] Runtime error while looking up module")
             .expect("[Module Lookup] Unable to find module");
         let struct_def_idx = if self.struct_handle_table.contains_key(&module_id) {
@@ -122,7 +131,7 @@ where
                         .enumerate()
                         .map(|(struct_def_index, struct_def)| {
                             let handle = module.struct_handle_at(struct_def.struct_handle);
-                            let name = module.string_at(handle.name).to_string();
+                            let name = module.identifier_at(handle.name).to_owned();
                             (
                                 name,
                                 StructDefinitionIndex::new(struct_def_index as TableIndex),
@@ -140,44 +149,43 @@ where
     /// Build an inhabitant of the type given by `sig_token`. Note that as opposed to the
     /// inhabitant generation that is performed in the `StackGenerator` this does _not_ take the
     /// instruction and generates inhabitants in a semantically agnostic way.
-    pub fn inhabit(&mut self, sig_token: SignatureToken) -> Local {
+    pub fn inhabit(&mut self, sig_token: &SignatureToken) -> Value {
         match sig_token {
-            SignatureToken::Bool => Local::bool(self.next_bool()),
-            SignatureToken::U64 => Local::u64(self.next_int()),
-            SignatureToken::String => Local::string(self.next_str()),
-            SignatureToken::Address => Local::address(self.next_addr()),
-            SignatureToken::Reference(box sig) | SignatureToken::MutableReference(box sig) => {
-                let underlying_value = self.inhabit(sig);
-                underlying_value
-                    .borrow_local()
-                    .expect("Unable to generate valid reference value")
+            SignatureToken::Bool => Value::bool(self.next_bool()),
+            SignatureToken::U64 => Value::u64(self.next_int()),
+            SignatureToken::String => Value::string(self.next_vm_string()),
+            SignatureToken::Address => Value::address(self.next_addr()),
+            SignatureToken::Reference(sig) | SignatureToken::MutableReference(sig) => {
+                let underlying_value = self.inhabit(&*sig);
+                Value::reference(Reference::new(underlying_value))
             }
-            SignatureToken::ByteArray => Local::bytearray(self.next_bytearray()),
-            SignatureToken::Struct(struct_handle_idx) => {
+            SignatureToken::ByteArray => Value::byte_array(self.next_bytearray()),
+            SignatureToken::Struct(struct_handle_idx, _) => {
                 assert!(self.root_module.struct_defs().len() > 1);
                 let struct_definition = self
                     .root_module
-                    .struct_def_at(self.resolve_struct_handle(struct_handle_idx).2);
-                let num_fields = struct_definition.field_count as usize;
-                let index = struct_definition.fields;
+                    .struct_def_at(self.resolve_struct_handle(*struct_handle_idx).2);
+                let (num_fields, index) = match struct_definition.field_information {
+                    StructFieldInformation::Native => {
+                        panic!("[Struct Generation] Unexpected native struct")
+                    }
+                    StructFieldInformation::Declared {
+                        field_count,
+                        fields,
+                    } => (field_count as usize, fields),
+                };
                 let fields = self
                     .root_module
                     .field_def_range(num_fields as MemberCount, index);
-                let mutvals = fields
+                let values = fields
                     .iter()
                     .map(|field| {
-                        self.inhabit(
-                            self.root_module
-                                .type_signature_at(field.signature)
-                                .0
-                                .clone(),
-                        )
-                        .value()
-                        .expect("[Struct Generation] Unable to get underlying value for generated struct field.")
+                        self.inhabit(&self.root_module.type_signature_at(field.signature).0)
                     })
                     .collect();
-                Local::struct_(mutvals)
+                Value::struct_(Struct::new(values))
             }
+            SignatureToken::TypeParameter(_) => unimplemented!(),
         }
     }
 }

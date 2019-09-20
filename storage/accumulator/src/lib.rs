@@ -55,11 +55,14 @@
 //!
 //! # Position and Physical Representation
 //! As a Merkle Accumulator tree expands to the right and upwards, we number newly frozen nodes
-//! monotonically. (One way to do it is simply to use in-order index of nodes.) We call the
-//! stated numbers identifying nodes below simply "Position".
+//! monotonically. One way to do it is simply to use in-order index of nodes, and this is what
+//! we do for the in-memory representation. We call the stated numbers identifying nodes below
+//! simply "Position", and unless otherwise stated, this is the in-order position.
 //!
-//! And with that we can map a Merkle Accumulator into a key-value storage: key is the position of a
-//! node, value is hash value it carries.
+//! For writing to disk however, we write all the children of a node before the parent.
+//! Thus for disk write order, it is more convenient to use the post-order position as an index.
+//! And with that we can map a Merkle Accumulator into a key-value storage: key is the post-order
+//! position of a node, and the value is hash value it carries.
 //!
 //! We store only Frozen nodes, and generate non-Frozen nodes on the fly when accessing the tree.
 //! This way, the physical representation of the tree is append-only, i.e. once written to physical
@@ -68,42 +71,40 @@
 //! Here is what we persist for the logical tree in the above example:
 //!
 //! ```text
-//!          Fzn2(3)
+//!          Fzn2(6)
 //!         /      \
 //!        /        \
-//!    Fzn1(1)       Fzn3(5)
+//!    Fzn1(2)       Fzn3(5)
 //!   /     \       /     \
-//!  L0(0)  L1(2)  L2(4)  L3(6)  L4(8)
+//!  L0(0)  L1(1)  L2(3)  L3(4)  L4(7)
 //! ```
 //!
 //! When the next leaf node is persisted, the physical representation will be:
 //!
 //! ```text
-//!          Fzn2(3)
+//!          Fzn2(6)
 //!         /      \
 //!        /        \
-//!    Fzn1(1)       Fzn3(5)       Fzn4(9)
+//!    Fzn1(2)       Fzn3(5)       Fzn4(9)
 //!   /     \       /     \       /      \
-//!  L0(0)  L1(2)  L2(4)  L3(6)  L4(8)   L5(10)
+//!  L0(0)  L1(1)  L2(3)  L3(4)  L4(7)   L5(8)
 //! ```
 //!
-//! The numbering corresponds to the in-order traversal of the tree.
+//! The numbering corresponds to the post-order traversal of the tree.
 //!
 //! To think in key-value pairs:
 //! ```text
 //! |<-key->|<--value-->|
 //! |   0   | hash_L0   |
-//! |   1   | hash_Fzn1 |
-//! |   2   | hash_L1   |
+//! |   1   | hash_L1   |
+//! |   2   | hash_Fzn1 |
 //! |  ...  |   ...     |
 //! ```
 
 use crypto::hash::{CryptoHash, CryptoHasher, HashValue, ACCUMULATOR_PLACEHOLDER_HASH};
 use failure::prelude::*;
 use std::marker::PhantomData;
-use types::proof::{
-    position::Position, treebits::NodeDirection, AccumulatorProof, MerkleTreeInternalNode,
-};
+use types::proof::{position::Position, AccumulatorProof, MerkleTreeInternalNode};
 
 /// Defines the interface between `MerkleAccumulator` and underlying storage.
 pub trait HashReader {
@@ -174,14 +175,14 @@ where
             if self.num_leaves == 0 {
                 return Ok((*ACCUMULATOR_PLACEHOLDER_HASH, Vec::new()));
             } else {
-                let root_hash = self.get_hash(Position::get_root_position(self.num_leaves - 1))?;
+                let root_hash = self.get_hash(Position::root_from_leaf_count(self.num_leaves))?;
                 return Ok((root_hash, Vec::new()));
             }
         }
 
         let num_new_leaves = new_leaves.len();
-        let last_new_leaf_idx = self.num_leaves + num_new_leaves as u64 - 1;
-        let root_level = Position::get_root_position(last_new_leaf_idx).get_level() as usize;
+        let last_new_leaf_count = self.num_leaves + num_new_leaves as u64;
+        let root_level = Position::root_from_leaf_count(last_new_leaf_count).level() as usize;
         let mut to_freeze = Vec::with_capacity(Self::max_to_freeze(num_new_leaves, root_level));
 
         // create one new node for each new leaf hash
@@ -240,10 +241,10 @@ where
 
         // first node may be a right child, in that case pair it with its existing sibling
         let (first_pos, first_hash) = iter.peek().expect("Current level is empty");
-        if first_pos.get_direction_for_self() == NodeDirection::Right {
+        if !first_pos.is_left_child() {
             parent_level.push((
-                first_pos.get_parent(),
-                Self::hash_internal_node(self.reader.get(first_pos.get_sibling())?, *first_hash),
+                first_pos.parent(),
+                Self::hash_internal_node(self.reader.get(first_pos.sibling())?, *first_hash),
             ));
             iter.next();
         }
@@ -260,7 +261,7 @@ where
             };
 
             parent_level.push((
-                left_pos.get_parent(),
+                left_pos.parent(),
                 Self::hash_internal_node(*left_hash, *right_hash),
             ));
         }
@@ -286,8 +287,8 @@ where
         } else {
             // non-frozen non-placeholder node
             Ok(Self::hash_internal_node(
-                self.get_hash(position.get_left_child())?,
-                self.get_hash(position.get_right_child())?,
+                self.get_hash(position.left_child())?,
+                self.get_hash(position.right_child())?,
             ))
         }
     }
@@ -302,11 +303,11 @@ where
         );
 
         let leaf_pos = Position::from_leaf_index(leaf_index);
-        let root_pos = Position::get_root_position(self.num_leaves - 1);
+        let root_pos = Position::root_from_leaf_count(self.num_leaves);
 
         let siblings: Vec<HashValue> = leaf_pos
             .iter_ancestor_sibling()
-            .take(root_pos.get_level() as usize)
+            .take(root_pos.level() as usize)
             .map(|p| self.get_hash(p))
             .collect::<Result<Vec<HashValue>>>()?
             .into_iter()
